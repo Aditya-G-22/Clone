@@ -21,12 +21,12 @@ from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
-# ── ENVIRONMENT ───────────────────────────────────────────────────────────────
+# ──────────────────────────────────── ENVIRONMENT ───────────────────────────────────────────────────────────────
 # Must run before anything that needs API keys.
 
 load_dotenv()
 
-# ── STATE ─────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────── STATE ─────────────────────────────────────────────────────────────────────
 # AgentState is the memory that flows through every node in the graph.
 # `messages` holds the full conversation history.
 # `add_messages` is a reducer — it appends new messages instead of replacing.
@@ -34,7 +34,7 @@ load_dotenv()
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
-# ── TOOLS ─────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────── TOOLS ─────────────────────────────────────────────────────────────────────
 # Tools give the LLM the ability to act on the real world.
 # The LLM cannot touch your filesystem — it requests a tool call,
 # and our Python functions execute it.
@@ -82,7 +82,7 @@ def write_file(path: str, content: str) -> str:
 
 tools = [read_file, list_files, write_file]
 
-# ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
+# ──────────────────────────────── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 # Hidden instructions sent to the LLM on every request.
 # Shapes its personality and behavior. The user never sees this.
 
@@ -92,7 +92,7 @@ Only use tools (read_file, list_files, write_file) when the user explicitly asks
 For general questions, answer directly without using tools.
 Be concise. Format code with proper markdown code blocks."""
 
-# ── GRAPH NODES ───────────────────────────────────────────────────────────────
+# ──────────────────────────────── GRAPH NODES ───────────────────────────────────────────────────────────────
 # A node is a function that receives state, does something, and returns
 # only the fields that changed. LangGraph merges the changes into state.
 
@@ -122,7 +122,7 @@ def should_continue(state: AgentState) -> str:
         return "execute_tools"
     return END
 
-# ── GRAPH ─────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────── GRAPH ─────────────────────────────────────────────────────────────────────
 # Wires the nodes together into a loop:
 #
 #   [START] → call_claude → tool_use? → execute_tools ─┐
@@ -140,7 +140,7 @@ def build_graph():
 
 agent = build_graph()
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────── CLI ───────────────────────────────────────────────────────────────────────
 # Entry point when running: python main.py
 # Asks the user to pick a model, then starts a chat loop.
 # Each message is independent — no memory between turns.
