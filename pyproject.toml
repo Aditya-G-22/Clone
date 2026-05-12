@@ -10,4 +10,5 @@ dependencies = [
     "langchain-groq>=1.1.2",
     "langgraph>=1.1.10",
     "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
 ]
