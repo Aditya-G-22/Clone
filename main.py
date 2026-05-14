@@ -13,10 +13,16 @@
 # =============================================================================
 
 import os
+import time
+import subprocess
+import requests
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_anthropic import ChatAnthropic
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
@@ -26,49 +32,38 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 from rich.rule import Rule
 
-# ──────────────────────────────── ENVIRONMENT ───────────────────────────────────────────────────────────────
-# Must run before anything that needs API keys.
-
+# load API keys from .env file
 load_dotenv()
 
-# ──────────────────────────────── RICH CONSOLE ──────────────────────────────────────────────────────────────
-# Single Console instance used everywhere for styled output.
-# Think of it as a smarter version of print().
-
+# one console used everywhere for pretty output
 console = Console()
 
 # ────────────────────────────────────── STATE ─────────────────────────────────────────────────────────────────────
-# AgentState is the memory that flows through every node in the graph.
-# `messages` holds the full conversation history.
-# `add_messages` is a reducer — it appends new messages instead of replacing.
+# this is basically the memory of the agent — all messages live here
+# add_messages makes sure new messages are appended, not replaced
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
 # ────────────────────────────────────── TOOLS ─────────────────────────────────────────────────────────────────────
-# Tools give the LLM the ability to act on the real world.
-# The LLM cannot touch your filesystem — it requests a tool call,
-# and our Python functions execute it.
-#
-# Rules:
-#   - Each function must have a docstring (LangChain uses it as the description)
-#   - Always return a string (the result goes back to the LLM as text)
-#   - Always use try/except (a bad path should not crash the agent)
+# tools are the hands of the agent — it can't do anything without them
+# the LLM asks for a tool, we run it, and send the result back
 
-BLOCKED_FILES = [".env", ".env.example"]   # files the agent is never allowed to read
+# these files are never readable — security measure
+BLOCKED_FILES = [".env", ".env.example"]
 
 @tool
 def read_file(path: str) -> str:
     """Read the contents of a file at the given path."""
     if os.path.basename(path) in BLOCKED_FILES:
-        return f"Error: Access to '{path}' is blocked for security reasons."
+        return f"Error: reading '{path}' is not allowed."
     try:
         with open(path, "r") as f:
             return f.read()
     except FileNotFoundError:
-        return f"Error: File not found at '{path}'"
+        return f"Error: no file found at '{path}'"
     except Exception as e:
-        return f"Error reading file: {str(e)}"
+        return f"Error: {str(e)}"
 
 @tool
 def list_files(directory: str) -> str:
@@ -77,9 +72,9 @@ def list_files(directory: str) -> str:
         files = os.listdir(directory)
         return "\n".join(files)
     except FileNotFoundError:
-        return f"Error: Directory not found at '{directory}'"
+        return f"Error: no directory found at '{directory}'"
     except Exception as e:
-        return f"Error listing files: {str(e)}"
+        return f"Error: {str(e)}"
 
 @tool
 def write_file(path: str, content: str) -> str:
@@ -87,39 +82,126 @@ def write_file(path: str, content: str) -> str:
     try:
         with open(path, "w") as f:
             f.write(content)
-        return f"File written successfully to '{path}'"
+        return f"Done — file saved to '{path}'"
     except Exception as e:
-        return f"Error writing file: {str(e)}"
+        return f"Error: {str(e)}"
 
-tools = [read_file, list_files, write_file]
+@tool
+def delete_file(path: str) -> str:
+    """Delete a file at the given path."""
+    try:
+        os.remove(path)
+        return f"Done — '{path}' has been deleted."
+    except FileNotFoundError:
+        return f"Error: no file found at '{path}'"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-# ────────────────────────── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
-# Hidden instructions sent to the LLM on every request.
-# Shapes its personality and behavior. The user never sees this.
+@tool
+def run_command(command: str) -> str:
+    """Run a terminal command and return its output."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            return f"Error: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return "Error: command took too long (30s timeout)"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-SYSTEM_PROMPT = """You are an expert coding assistant like Cursor.
+@tool
+def search_web(query: str) -> str:
+    """Search the web for a topic and return top results with summaries."""
+    try:
+        results = []
+        # DDGS is DuckDuckGo search — free, no API key needed
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=5):
+                results.append(
+                    f"Title: {r['title']}\n"
+                    f"URL: {r['href']}\n"
+                    f"Summary: {r['body']}\n"
+                )
+        if not results:
+            return "No results found."
+        return "\n---\n".join(results)
+    except Exception as e:
+        return f"Error searching web: {str(e)}"
+
+@tool
+def read_url(url: str) -> str:
+    """Fetch and read the text content of a webpage or article."""
+    try:
+        # pretend to be a browser so websites don't block us
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # remove stuff we don't need like nav bars, scripts, footers
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+
+        text = soup.get_text(separator="\n", strip=True)
+
+        # cut it off at 5000 chars so we don't overload the LLM context
+        return text[:5000]
+    except Exception as e:
+        return f"Error reading URL: {str(e)}"
+
+# all tools in one list — execute_tools_node uses this to find the right function
+tools = [read_file, list_files, write_file, delete_file, run_command, search_web, read_url]
+
+# ────────────────────────── SYSTEM PROMPTS ─────────────────────────────────────────────────────────────
+# each agent gets its own personality via a different system prompt
+# the user never sees these — they shape how the LLM behaves
+
+CODING_PROMPT = """You are an expert coding assistant like Cursor.
 Help the user write, understand, debug, and improve their code.
-Only use tools (read_file, list_files, write_file) when the user explicitly asks you to read, list or write a file.
+Only use tools when the task requires it.
 For general questions, answer directly without using tools.
 Be concise. Format code with proper markdown code blocks."""
 
-# ────────────────────────── GRAPH NODES ───────────────────────────────────────────────────────────────
-# A node is a function that receives state, does something, and returns
-# only the fields that changed. LangGraph merges the changes into state.
+RESEARCH_PROMPT = """You are a thorough research assistant.
+When given a topic, search the web and read relevant articles to find accurate information.
+Always search first, then read the most relevant URLs for deeper information.
+Summarize your findings clearly and mention your sources."""
 
-def call_claude_node(state: AgentState):
-    """Node 1 — Send messages to the LLM and get a response."""
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    response = model_with_tools.invoke(messages)
-    return {"messages": [response]}
+FILE_PROMPT = """You are a file management assistant.
+Help the user read, write, list and delete files on their system.
+Always use the appropriate file tool for the task.
+Be careful with delete operations — confirm what you're doing."""
+
+TERMINAL_PROMPT = """You are a terminal assistant.
+Run the commands the user asks for and explain the output.
+If a command looks dangerous, warn the user before running it."""
+
+# ────────────────────────── GRAPH NODES ───────────────────────────────────────────────────────────────
+# nodes are the workers in the graph — each one does one job
+# they receive the current state, do something, and return what changed
+
+# this is a closure — it lets us create a node with a specific model + prompt baked in
+# without closures we'd have to use globals, which gets messy
+def make_call_model_node(llm, system_prompt=CODING_PROMPT):
+    def call_model_node(state: AgentState):
+        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        response = llm.invoke(messages)
+        return {"messages": [response]}
+    return call_model_node
 
 def execute_tools_node(state: AgentState):
-    """Node 2 — Execute the tool(s) the LLM requested."""
+    # the LLM asked for tools — we run them here and send results back
     last_message = state["messages"][-1]
     tool_map = {t.name: t for t in tools}
     results = []
     for tool_call in last_message.tool_calls:
-        # Show the user which tool is being called
         console.print(f"  [dim]⚙ using tool:[/dim] [yellow]{tool_call['name']}[/yellow] [dim]{tool_call['args']}[/dim]")
         result = tool_map[tool_call["name"]].invoke(tool_call["args"])
         results.append(ToolMessage(
@@ -129,44 +211,130 @@ def execute_tools_node(state: AgentState):
     return {"messages": results}
 
 def should_continue(state: AgentState) -> str:
-    """Router — if the LLM made tool calls, execute them. Otherwise end."""
+    # did the LLM ask for a tool? if yes keep going, if no we're done
     if state["messages"][-1].tool_calls:
         return "execute_tools"
     return END
 
-# ──────────────────────────────── GRAPH ─────────────────────────────────────────────────────────────────────
-# Wires the nodes together into a loop:
-#
-#   [START] → call_claude → tool_use? → execute_tools ─┐
-#                        → end_turn?  → [END]           │
-#                  ↑___________________________________ ─┘
+# ────────────────────────── ROUTERS ───────────────────────────────────────────────────────────────────
+# routers are just functions that look at the message and decide which agent should handle it
+# we use a small fast model for this so it doesn't slow things down
 
-def build_graph():
+def make_router(llm):
+    # top level router — decides between file, code, and research agents
+    def router(state: AgentState) -> str:
+        last_message = state["messages"][-1].content
+        prompt = f"""Classify this user message into one of three categories:
+- "file_agent": user wants to read, write, list or delete a LOCAL file or folder (message mentions a filename like main.py, test.txt, or a directory path)
+- "research_agent": user wants to search the web, research a topic, read online articles or find information on the internet
+- "code_agent": user wants coding help, debugging, explanations, or wants to run a terminal/shell command
+
+IMPORTANT: "read main.py" or "read any_file.ext" = file_agent — it has a filename.
+IMPORTANT: "read this article" or "search for X" = research_agent — it's about the internet.
+IMPORTANT: "run", "execute", or any shell command (ls, git, pip) = code_agent.
+
+Message: {last_message}
+
+Reply with ONLY "file_agent", "research_agent", or "code_agent". Nothing else."""
+
+        response = llm.invoke([HumanMessage(content=prompt)])
+        decision = response.content.strip().lower()
+
+        if "file_agent" in decision:
+            console.print("  [dim]→ routing to:[/dim] [magenta]file_agent[/magenta]")
+            return "file_agent"
+        if "research_agent" in decision:
+            console.print("  [dim]→ routing to:[/dim] [magenta]research_agent[/magenta]")
+            return "research_agent"
+        console.print("  [dim]→ routing to:[/dim] [magenta]code_agent[/magenta]")
+        return "code_agent"
+    return router
+
+def make_code_router(llm):
+    # internal router inside code_agent — decides between terminal and plain coding
+    def code_router(state: AgentState) -> str:
+        last_message = state["messages"][-1].content
+        prompt = f"""Classify this message:
+- "terminal_agent": user wants to run a terminal or shell command (like ls, git, pip, python, etc.)
+- "call_model": user wants coding help, explanation or debugging (no terminal needed)
+
+Message: {last_message}
+
+Reply with ONLY "terminal_agent" or "call_model". Nothing else."""
+
+        response = llm.invoke([HumanMessage(content=prompt)])
+        decision = response.content.strip().lower()
+
+        if "terminal_agent" in decision:
+            console.print("  [dim]→ routing to:[/dim] [magenta]terminal_agent[/magenta]")
+            return "terminal_agent"
+        console.print("  [dim]→ routing to:[/dim] [magenta]call_model[/magenta]")
+        return "call_model"
+    return code_router
+
+# ──────────────────────────────── SUBGRAPHS ──────────────────────────────────────────────────────────────
+# each subgraph is a mini agent with its own tools and loop
+# they look like a single node from the outside but are full graphs inside
+
+def build_file_agent(model):
+    file_llm = model.bind_tools([read_file, list_files, write_file, delete_file])
     graph = StateGraph(AgentState)
-    graph.add_node("call_claude", call_claude_node)
+    graph.add_node("call_model", make_call_model_node(file_llm, FILE_PROMPT))
     graph.add_node("execute_tools", execute_tools_node)
-    graph.set_entry_point("call_claude")
-    graph.add_conditional_edges("call_claude", should_continue)
-    graph.add_edge("execute_tools", "call_claude")
+    graph.set_entry_point("call_model")
+    graph.add_edge("execute_tools", "call_model")
+    graph.add_conditional_edges("call_model", should_continue)
     return graph.compile()
 
-agent = build_graph()
+def build_research_agent(model):
+    # research agent gets search + read tools so it can look stuff up
+    research_llm = model.bind_tools([search_web, read_url])
+    graph = StateGraph(AgentState)
+    graph.add_node("call_model", make_call_model_node(research_llm, RESEARCH_PROMPT))
+    graph.add_node("execute_tools", execute_tools_node)
+    graph.set_entry_point("call_model")
+    graph.add_conditional_edges("call_model", should_continue)
+    graph.add_edge("execute_tools", "call_model")
+    return graph.compile()
 
-# ────────────────────────────────────── CLI ───────────────────────────────────────────────────────────────────────
-# Entry point when running: python main.py
-# Shows a banner, asks the user to pick a model, then starts a chat loop.
-# Each message is independent — no memory between turns.
+def build_terminal_agent(model):
+    terminal_llm = model.bind_tools([run_command])
+    graph = StateGraph(AgentState)
+    graph.add_node("call_model", make_call_model_node(terminal_llm, TERMINAL_PROMPT))
+    graph.add_node("execute_tools", execute_tools_node)
+    graph.set_entry_point("call_model")
+    graph.add_conditional_edges("call_model", should_continue)
+    graph.add_edge("execute_tools", "call_model")
+    return graph.compile()
 
-if __name__ == "__main__":
+def build_code_agent(model, router_model):
+    # code agent has its own internal router — it routes to terminal or plain LLM
+    graph = StateGraph(AgentState)
+    terminal_agent = build_terminal_agent(model)
+    graph.add_node("terminal_agent", terminal_agent)
+    graph.add_node("call_model", make_call_model_node(model, CODING_PROMPT))
+    graph.add_conditional_edges(START, make_code_router(router_model))
+    graph.add_edge("terminal_agent", END)
+    graph.add_edge("call_model", END)
+    return graph.compile()
 
-    # Banner
-    console.print(Panel.fit(
-        "[bold cyan]Cursor Clone[/bold cyan] — CLI Coding Agent\n"
-        "[dim]Powered by LangGraph + LangChain[/dim]",
-        border_style="cyan"
-    ))
+def build_graph(model, router_model):
+    # the parent graph — all agents live here as nodes
+    graph = StateGraph(AgentState)
+    graph.add_node("file_agent", build_file_agent(model))
+    graph.add_node("research_agent", build_research_agent(model))
+    graph.add_node("code_agent", build_code_agent(model, router_model))
+    graph.add_conditional_edges(START, make_router(router_model))
+    graph.add_edge("file_agent", END)
+    graph.add_edge("research_agent", END)
+    graph.add_edge("code_agent", END)
+    memory = MemorySaver()
+    return graph.compile(checkpointer=memory)
 
-    # Model selection
+# ────────────────────────── MODEL SELECTION ───────────────────────────────────────────────────────────────────────
+# pulled into a function so we can call it again when user types "switch"
+
+def select_model():
     console.print("\n[bold]Select a model:[/bold]")
     console.print("  [cyan]1.[/cyan] Llama 3.3 70b  [dim](free  — Groq)[/dim]")
     console.print("  [cyan]2.[/cyan] Claude Sonnet  [dim](paid  — Anthropic)[/dim]")
@@ -174,43 +342,85 @@ if __name__ == "__main__":
     choice = console.input("\n[bold cyan]Enter 1 or 2:[/bold cyan] ").strip()
 
     if choice == "1":
-        MODEL_NAME = "llama-3.3-70b-versatile"
-        model = ChatGroq(model=MODEL_NAME)
+        model_name = "llama-3.3-70b-versatile"
+        model = ChatGroq(model=model_name)
     elif choice == "2":
-        MODEL_NAME = "claude-sonnet-4-6"
-        model = ChatAnthropic(model=MODEL_NAME)
+        model_name = "claude-sonnet-4-6"
+        model = ChatAnthropic(model=model_name)
     else:
         console.print("[yellow]Invalid choice — defaulting to Llama[/yellow]")
-        MODEL_NAME = "llama-3.3-70b-versatile"
-        model = ChatGroq(model=MODEL_NAME)
+        model_name = "llama-3.3-70b-versatile"
+        model = ChatGroq(model=model_name)
 
-    # Bind tools AFTER model is selected so the right model gets them
-    model_with_tools = model.bind_tools(tools)
+    return model, model_name
+
+# ────────────────────────────────────── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    console.print(Panel.fit(
+        "[bold cyan]Cursor Clone[/bold cyan] — CLI Coding Agent\n"
+        "[dim]Powered by LangGraph + LangChain[/dim]",
+        border_style="cyan"
+    ))
+
+    # pick the main model
+    model, MODEL_NAME = select_model()
+
+    # small fast model just for routing — saves time on every message
+    router_model = ChatGroq(model="llama-3.1-8b-instant")
+
+    # build the full agent graph
+    agent = build_graph(model, router_model)
 
     console.print(f"\n[dim]Model  :[/dim] [green]{MODEL_NAME}[/green]")
-    console.print("[dim]Type 'quit' to exit[/dim]\n")
+    console.print(f"[dim]Router :[/dim] [green]llama-3.1-8b-instant[/green]")
+    console.print("[dim]Commands: 'quit' • 'switch' • 'new'[/dim]\n")
     console.print(Rule(style="dim"))
 
-    # Chat loop
+    # each session gets a unique id based on time so memory is separate
+    session_id = f"session_{int(time.time())}"
+    config = {"configurable": {"thread_id": session_id}}
+
     while True:
         user_input = console.input("\n[bold green]you:[/bold green] ").strip()
 
+        # exit the program
         if user_input.lower() == "quit":
             console.print(Panel.fit("[dim]Goodbye![/dim]", border_style="dim"))
             break
 
+        # switch to a different model — rebuilds the whole agent
+        if user_input.lower() == "switch":
+            model, MODEL_NAME = select_model()
+            agent = build_graph(model, router_model)
+            session_id = f"session_{int(time.time())}"
+            config = {"configurable": {"thread_id": session_id}}
+            console.print(f"[dim]Switched to[/dim] [green]{MODEL_NAME}[/green]")
+            console.print(Rule(style="dim"))
+            continue
+
+        # start a fresh conversation — old memory is cleared
+        if user_input.lower() == "new":
+            session_id = f"session_{int(time.time())}"
+            config = {"configurable": {"thread_id": session_id}}
+            console.print("[dim]Started a new conversation — previous context cleared.[/dim]")
+            console.print(Rule(style="dim"))
+            continue
+
         if not user_input:
             continue
 
-        # Spinner while the agent is thinking
         try:
             with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-                result = agent.invoke({
-                    "messages": [HumanMessage(content=user_input)]
-                })
+                result = agent.invoke(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=config
+                )
 
-            # Render the response as markdown inside a panel
             response_text = result["messages"][-1].content
+            if not response_text:
+                response_text = "Done."
             console.print(Panel(
                 Markdown(response_text),
                 title="[bold cyan]Assistant[/bold cyan]",
@@ -218,10 +428,14 @@ if __name__ == "__main__":
                 padding=(1, 2)
             ))
 
+        except KeyboardInterrupt:
+            # user pressed Ctrl+C to stop a slow response
+            console.print("\n[dim]Stopped. Type 'new' to clear context or keep chatting.[/dim]")
+
         except Exception as e:
             console.print(Panel(
-                f"[red]Error:[/red] The model failed to respond correctly.\n"
-                f"Try rephrasing or switch to Claude.\n\n[dim]{str(e)[:150]}[/dim]",
+                f"[red]Error:[/red] Something went wrong.\n"
+                f"Try rephrasing or type 'switch' to change models.\n\n[dim]{str(e)[:150]}[/dim]",
                 title="[red]Error[/red]",
                 border_style="red"
             ))
