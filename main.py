@@ -23,10 +23,11 @@ from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
 from langchain_anthropic import ChatAnthropic
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, trim_messages
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -44,6 +45,7 @@ console = Console()
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
+    iterations: int  # safety counter — stops infinite tool loops
 
 # ────────────────────────────────────── TOOLS ─────────────────────────────────────────────────────────────────────
 # tools are the hands of the agent — it can't do anything without them
@@ -191,7 +193,15 @@ If a command looks dangerous, warn the user before running it."""
 # without closures we'd have to use globals, which gets messy
 def make_call_model_node(llm, system_prompt=CODING_PROMPT):
     def call_model_node(state: AgentState):
-        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        # trim old messages first, then add system prompt on top
+        trimmed = trim_messages(
+            state["messages"],
+            max_tokens=20,
+            strategy="last",
+            token_counter=len,
+            include_system=True,
+        )
+        messages = [SystemMessage(content=system_prompt)] + trimmed
         response = llm.invoke(messages)
         return {"messages": [response]}
     return call_model_node
@@ -201,18 +211,45 @@ def execute_tools_node(state: AgentState):
     last_message = state["messages"][-1]
     tool_map = {t.name: t for t in tools}
     results = []
+
+    # these tools can cause damage — always ask the user first
+    DANGEROUS_TOOLS = {"delete_file", "run_command"}
+
     for tool_call in last_message.tool_calls:
-        console.print(f"  [dim]⚙ using tool:[/dim] [yellow]{tool_call['name']}[/yellow] [dim]{tool_call['args']}[/dim]")
-        result = tool_map[tool_call["name"]].invoke(tool_call["args"])
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        if tool_name in DANGEROUS_TOOLS:
+            # interrupt() pauses the entire graph here and sends this message up to the CLI
+            # the graph won't move until agent.invoke(Command(resume=answer)) is called
+            answer = interrupt(
+                f"Tool: {tool_name}\n"
+                f"Args: {tool_args}\n"
+                f"Type 'yes' to confirm or anything else to cancel."
+            )
+            if answer.strip().lower() not in ("yes", "y"):
+                console.print(f"  [dim]✗ cancelled:[/dim] [red]{tool_name}[/red]")
+                results.append(ToolMessage(
+                    content="Action cancelled by user.",
+                    tool_call_id=tool_call["id"]
+                ))
+                continue
+
+        console.print(f"  [dim]⚙ using tool:[/dim] [yellow]{tool_name}[/yellow] [dim]{tool_args}[/dim]")
+        result = tool_map[tool_name].invoke(tool_args)
         results.append(ToolMessage(
             content=str(result),
             tool_call_id=tool_call["id"]
         ))
-    return {"messages": results}
+
+    return {"messages": results, "iterations": state.get("iterations", 0) + 1}
 
 def should_continue(state: AgentState) -> str:
     # did the LLM ask for a tool? if yes keep going, if no we're done
     if state["messages"][-1].tool_calls:
+        if state.get("iterations", 0) >= 10:
+            console.print("  [dim yellow]⚠ max iterations reached — stopping loop[/dim yellow]")
+            return END
         return "execute_tools"
     return END
 
@@ -412,21 +449,48 @@ if __name__ == "__main__":
             continue
 
         try:
-            with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-                result = agent.invoke(
-                    {"messages": [HumanMessage(content=user_input)]},
-                    config=config
-                )
+            # stream_mode="messages" gives us AIMessageChunks one token at a time
+            # this means the response starts printing immediately instead of waiting
+            console.print(Rule(style="cyan"))
+            console.print("[bold cyan]Assistant:[/bold cyan]")
 
-            response_text = result["messages"][-1].content
-            if not response_text:
-                response_text = "Done."
-            console.print(Panel(
-                Markdown(response_text),
-                title="[bold cyan]Assistant[/bold cyan]",
-                border_style="cyan",
-                padding=(1, 2)
-            ))
+            def stream_response(input_data):
+                """Stream tokens and print them as they arrive."""
+                for chunk, metadata in agent.stream(
+                    input_data,
+                    config=config,
+                    stream_mode="messages"
+                ):
+                    # only print AI text chunks — skip tool call chunks and routing decisions
+                    if (hasattr(chunk, "content")
+                            and isinstance(chunk.content, str)
+                            and chunk.content
+                            and not getattr(chunk, "tool_call_chunks", None)):
+                        print(chunk.content, end="", flush=True)
+                print()  # newline once the stream ends
+
+            stream_response({"messages": [HumanMessage(content=user_input)]})
+            console.print(Rule(style="cyan"))
+
+            # check if the graph paused mid-run waiting for human confirmation
+            # this happens when execute_tools_node hits a DANGEROUS_TOOLS call
+            graph_state = agent.get_state(config)
+            while graph_state.tasks and any(t.interrupts for t in graph_state.tasks):
+                # pull the message that interrupt() sent us
+                interrupt_msg = graph_state.tasks[0].interrupts[0].value
+                console.print(f"\n[bold yellow]⚠  Confirmation required:[/bold yellow]")
+                console.print(f"[yellow]{interrupt_msg}[/yellow]")
+                answer = console.input("[bold yellow]your answer:[/bold yellow] ").strip()
+
+                # Command(resume=answer) sends the answer back into the graph
+                # the graph picks up exactly where interrupt() was called
+                console.print(Rule(style="cyan"))
+                console.print("[bold cyan]Assistant:[/bold cyan]")
+                stream_response(Command(resume=answer))
+                console.print(Rule(style="cyan"))
+
+                # check again — there might be more dangerous tools in the same request
+                graph_state = agent.get_state(config)
 
         except KeyboardInterrupt:
             # user pressed Ctrl+C to stop a slow response
