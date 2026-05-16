@@ -17,17 +17,17 @@ import time
 import subprocess
 import requests
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+from langchain_tavily import TavilySearch
 from dotenv import load_dotenv
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver 
 from langgraph.types import interrupt, Command
 from langchain_anthropic import ChatAnthropic
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, trim_messages
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, trim_messages, RemoveMessage
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
@@ -46,6 +46,7 @@ console = Console()
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     iterations: int  # safety counter — stops infinite tool loops
+    summary : str # compressed memory of old conversations
 
 # ────────────────────────────────────── TOOLS ─────────────────────────────────────────────────────────────────────
 # tools are the hands of the agent — it can't do anything without them
@@ -108,12 +109,14 @@ def run_command(command: str) -> str:
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",  # replace unreadable chars instead of crashing
             timeout=30
         )
         if result.returncode == 0:
-            return result.stdout
+            return result.stdout.strip() or "Command ran successfully (no output)."
         else:
-            return f"Error: {result.stderr}"
+            return f"Error: {result.stderr.strip()}"
     except subprocess.TimeoutExpired:
         return "Error: command took too long (30s timeout)"
     except Exception as e:
@@ -121,20 +124,20 @@ def run_command(command: str) -> str:
 
 @tool
 def search_web(query: str) -> str:
-    """Search the web for a topic and return top results with summaries."""
+    """Search the web for a topic and return top results with titles, URLs and summaries."""
     try:
-        results = []
-        # DDGS is DuckDuckGo search — free, no API key needed
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=5):
-                results.append(
-                    f"Title: {r['title']}\n"
-                    f"URL: {r['href']}\n"
-                    f"Summary: {r['body']}\n"
+        tavily = TavilySearch(max_results=5)
+        results = tavily.invoke({"query": query})
+        if isinstance(results, list):
+            formatted = []
+            for r in results:
+                formatted.append(
+                    f"Title: {r.get('title', 'N/A')}\n"
+                    f"URL: {r.get('url', 'N/A')}\n"
+                    f"Content: {r.get('content', 'N/A')}"
                 )
-        if not results:
-            return "No results found."
-        return "\n---\n".join(results)
+            return "\n---\n".join(formatted)
+        return str(results)
     except Exception as e:
         return f"Error searching web: {str(e)}"
 
@@ -201,7 +204,13 @@ def make_call_model_node(llm, system_prompt=CODING_PROMPT):
             token_counter=len,
             include_system=True,
         )
-        messages = [SystemMessage(content=system_prompt)] + trimmed
+        summary = state.get("summary", "")
+        if summary:
+            system_with_memory = system_prompt + f"\n\nContext from previous conversation:\n{summary}"
+        else:
+            system_with_memory = system_prompt
+
+        messages = [SystemMessage(content=system_with_memory)] + trimmed
         response = llm.invoke(messages)
         return {"messages": [response]}
     return call_model_node
@@ -253,6 +262,32 @@ def should_continue(state: AgentState) -> str:
         return "execute_tools"
     return END
 
+def should_summarize(state: AgentState) -> str:
+    if len(state["messages"]) > 10:
+        return "summarize"
+    return END
+
+def make_summarize_node(llm) :
+    def summarize_node(state: AgentState) :
+        summary = state.get("summary", "")
+        messages = state["messages"]
+        if summary:
+            prompt = (
+                f"This is the existing summary:\n{summary}\n\n"
+                f"Extend it with the new messages above in 3-4 sentences:"
+            )
+        else:
+            prompt = "Summarize this conversation in 3-4 sentences, focusing on what was done and any important context:"
+
+        response = llm.invoke(messages + [HumanMessage(content=prompt)])
+
+        # delete everything except the last 4 messages
+        delete_messages = [RemoveMessage(id=m.id) for m in messages[:-4]]
+        console.print("[dim green]✓ summarizing conversation...[/dim green]")
+
+        return {"summary": response.content, "messages": delete_messages}
+    return summarize_node
+        
 # ────────────────────────── ROUTERS ───────────────────────────────────────────────────────────────────
 # routers are just functions that look at the message and decide which agent should handle it
 # we use a small fast model for this so it doesn't slow things down
@@ -355,17 +390,18 @@ def build_code_agent(model, router_model):
     graph.add_edge("call_model", END)
     return graph.compile()
 
-def build_graph(model, router_model):
+def build_graph(model, router_model, memory):
     # the parent graph — all agents live here as nodes
     graph = StateGraph(AgentState)
     graph.add_node("file_agent", build_file_agent(model))
     graph.add_node("research_agent", build_research_agent(model))
     graph.add_node("code_agent", build_code_agent(model, router_model))
+    graph.add_node("summarize", make_summarize_node(model))
     graph.add_conditional_edges(START, make_router(router_model))
-    graph.add_edge("file_agent", END)
-    graph.add_edge("research_agent", END)
-    graph.add_edge("code_agent", END)
-    memory = MemorySaver()
+    graph.add_conditional_edges("file_agent", should_summarize)
+    graph.add_conditional_edges("research_agent", should_summarize)
+    graph.add_conditional_edges("code_agent", should_summarize)
+    graph.add_edge("summarize", END)
     return graph.compile(checkpointer=memory)
 
 # ────────────────────────── MODEL SELECTION ───────────────────────────────────────────────────────────────────────
@@ -395,6 +431,8 @@ def select_model():
 
 if __name__ == "__main__":
 
+  with SqliteSaver.from_conn_string("memory.db") as memory:
+
     console.print(Panel.fit(
         "[bold cyan]Cursor Clone[/bold cyan] — CLI Coding Agent\n"
         "[dim]Powered by LangGraph + LangChain[/dim]",
@@ -407,8 +445,8 @@ if __name__ == "__main__":
     # small fast model just for routing — saves time on every message
     router_model = ChatGroq(model="llama-3.1-8b-instant")
 
-    # build the full agent graph
-    agent = build_graph(model, router_model)
+    # build the full agent graph — memory passed in from the with block above
+    agent = build_graph(model, router_model, memory)
 
     console.print(f"\n[dim]Model  :[/dim] [green]{MODEL_NAME}[/green]")
     console.print(f"[dim]Router :[/dim] [green]llama-3.1-8b-instant[/green]")
@@ -430,7 +468,7 @@ if __name__ == "__main__":
         # switch to a different model — rebuilds the whole agent
         if user_input.lower() == "switch":
             model, MODEL_NAME = select_model()
-            agent = build_graph(model, router_model)
+            agent = build_graph(model, router_model, memory)
             session_id = f"session_{int(time.time())}"
             config = {"configurable": {"thread_id": session_id}}
             console.print(f"[dim]Switched to[/dim] [green]{MODEL_NAME}[/green]")
@@ -465,7 +503,8 @@ if __name__ == "__main__":
                     if (hasattr(chunk, "content")
                             and isinstance(chunk.content, str)
                             and chunk.content
-                            and not getattr(chunk, "tool_call_chunks", None)):
+                            and not getattr(chunk, "tool_call_chunks", None)
+                            and metadata.get("langgraph_node") != "summarize"):
                         print(chunk.content, end="", flush=True)
                 print()  # newline once the stream ends
 
