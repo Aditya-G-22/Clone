@@ -47,6 +47,7 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     iterations: int  # safety counter — stops infinite tool loops
     summary : str # compressed memory of old conversations
+    retries : int # keeps the counter as to how many times agent has retried after an error
 
 # ────────────────────────────────────── TOOLS ─────────────────────────────────────────────────────────────────────
 # tools are the hands of the agent — it can't do anything without them
@@ -86,6 +87,30 @@ def write_file(path: str, content: str) -> str:
         with open(path, "w") as f:
             f.write(content)
         return f"Done — file saved to '{path}'"
+    except Exception as e:
+        return f"Error: {str(e)}"
+    
+@tool
+def edit_file(path: str, old_string: str, new_string: str) -> str:
+    """Edit a file by replacing a specific string with a new string.
+    Use this instead of write_file when making small changes to existing files."""
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+        
+        if old_string not in content:
+            return f"Error: could not find the specific text in '{path}'. No chages made"
+        
+        if content.count(old_string) > 1:
+            return f"Error: found multiple matches for the specified text in '{path}'. Make it more specific."
+        
+        new_content = content.replace(old_string, new_string, 1)
+        with open(path, "w") as f:
+            f.write(new_content)
+        
+        return f"Done — '{path}' updated successfully."
+    except FileNotFoundError:
+        return f"Error: no file found at '{path}'"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -162,7 +187,7 @@ def read_url(url: str) -> str:
         return f"Error reading URL: {str(e)}"
 
 # all tools in one list — execute_tools_node uses this to find the right function
-tools = [read_file, list_files, write_file, delete_file, run_command, search_web, read_url]
+tools = [read_file, list_files, write_file, edit_file, delete_file, run_command, search_web, read_url]
 
 # ────────────────────────── SYSTEM PROMPTS ─────────────────────────────────────────────────────────────
 # each agent gets its own personality via a different system prompt
@@ -172,21 +197,26 @@ CODING_PROMPT = """You are an expert coding assistant like Cursor.
 Help the user write, understand, debug, and improve their code.
 Only use tools when the task requires it.
 For general questions, answer directly without using tools.
-Be concise. Format code with proper markdown code blocks."""
+Be concise. Format code with proper markdown code blocks.
+If a tool returns an error, analyze the error message, fix your approach, and try again."""
 
 RESEARCH_PROMPT = """You are a thorough research assistant.
 When given a topic, search the web and read relevant articles to find accurate information.
 Always search first, then read the most relevant URLs for deeper information.
-Summarize your findings clearly and mention your sources."""
+Summarize your findings clearly and mention your sources.
+If a tool returns an error, analyze the error message, fix your approach, and try again."""
 
 FILE_PROMPT = """You are a file management assistant.
 Help the user read, write, list and delete files on their system.
 Always use the appropriate file tool for the task.
-Be careful with delete operations — confirm what you're doing."""
+Prefer edit_file over write_file when modifying existing files — only use write_file for creating new files.
+Be careful with delete operations — confirm what you're doing.
+If a tool returns an error, analyze the error message, fix your approach, and try again."""
 
 TERMINAL_PROMPT = """You are a terminal assistant.
 Run the commands the user asks for and explain the output.
-If a command looks dangerous, warn the user before running it."""
+If a command looks dangerous, warn the user before running it.
+If a tool returns an error, analyze the error message, fix your approach, and try again."""
 
 # ────────────────────────── GRAPH NODES ───────────────────────────────────────────────────────────────
 # nodes are the workers in the graph — each one does one job
@@ -251,13 +281,21 @@ def execute_tools_node(state: AgentState):
             tool_call_id=tool_call["id"]
         ))
 
-    return {"messages": results, "iterations": state.get("iterations", 0) + 1}
+    has_error = any("Error" in str(r.content) for r in results)
+    return {
+        "messages": results,
+        "iterations": state.get("iterations", 0) + 1,
+        "retries": state.get("retries", 0) + (1 if has_error else 0)
+    }
 
 def should_continue(state: AgentState) -> str:
     # did the LLM ask for a tool? if yes keep going, if no we're done
     if state["messages"][-1].tool_calls:
         if state.get("iterations", 0) >= 10:
             console.print("  [dim yellow]⚠ max iterations reached — stopping loop[/dim yellow]")
+            return END
+        if state.get("retries", 0) >= 3:
+            console.print("  [dim yellow]⚠ max retries reached — stopping loop[/dim yellow]")
             return END
         return "execute_tools"
     return END
@@ -349,7 +387,7 @@ Reply with ONLY "terminal_agent" or "call_model". Nothing else."""
 # they look like a single node from the outside but are full graphs inside
 
 def build_file_agent(model):
-    file_llm = model.bind_tools([read_file, list_files, write_file, delete_file])
+    file_llm = model.bind_tools([read_file, list_files, write_file, edit_file, delete_file])
     graph = StateGraph(AgentState)
     graph.add_node("call_model", make_call_model_node(file_llm, FILE_PROMPT))
     graph.add_node("execute_tools", execute_tools_node)
